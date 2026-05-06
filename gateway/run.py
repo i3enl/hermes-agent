@@ -1290,16 +1290,21 @@ class GatewayRunner:
 
         # Push the global voice.auto_tts default (config.yaml) onto the adapter.
         # Lazy import to avoid adding a module-level dep from gateway → hermes_cli.
+        _auto_tts_max_chars = 500
         try:
             from hermes_cli.config import load_config as _load_full_config
             _full_cfg = _load_full_config()
+            _voice_cfg = _full_cfg.get("voice") or {}
             _auto_tts_default = bool(
-                (_full_cfg.get("voice") or {}).get("auto_tts", False)
+                _voice_cfg.get("auto_tts", False)
             )
+            _auto_tts_max_chars = int(_voice_cfg.get("tts_max_chars", 500) or 500)
         except Exception:
             _auto_tts_default = False
         if hasattr(adapter, "_auto_tts_default"):
             adapter._auto_tts_default = _auto_tts_default
+        if hasattr(adapter, "_auto_tts_max_chars"):
+            adapter._auto_tts_max_chars = max(120, min(_auto_tts_max_chars, 4000))
 
         prefix = f"{platform.value}:"
         if isinstance(disabled_chats, set):
@@ -5618,6 +5623,14 @@ class GatewayRunner:
         if _is_shared_multi_user and source.user_name:
             message_text = f"[{source.user_name}] {message_text}"
 
+        if event.message_type == MessageType.VOICE:
+            message_text = (
+                "[Voice input note: answer for spoken playback first. Keep the audible answer "
+                "to 1-3 short sentences unless the user explicitly asks for detail. Avoid long "
+                "bullet lists; put extended detail in the text response only if needed.]\n\n"
+                f"{message_text}"
+            )
+
         if event.media_urls:
             image_paths = []
             audio_paths = []
@@ -8579,7 +8592,158 @@ class GatewayRunner:
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
         )
 
+        if await self._try_voice_gbrain_lite_evidence(
+            event=event,
+            transcript=transcript,
+            adapter=adapter,
+            text_channel_id=text_ch_id,
+        ):
+            return
+
         await adapter.handle_message(event)
+
+    def _load_voice_gbrain_lite_config(self) -> Dict[str, Any]:
+        """Return the configured voice gbrain-lite block, or an empty dict."""
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            cfg = _load_full_config() or {}
+        except Exception:
+            return {}
+        voice_cfg = cfg.get("voice") or {}
+        lite_cfg = voice_cfg.get("gbrain_lite") or {}
+        return lite_cfg if isinstance(lite_cfg, dict) else {}
+
+    def _build_voice_gbrain_lite_command(self, template: str, query: str) -> str:
+        """Expand the configured read-only retrieval command safely.
+
+        Both ``{query_quoted}`` and legacy ``{query}`` expand to a shell-quoted
+        transcript. The command template itself is trusted local config; the
+        transcript is user-controlled and must never be spliced in raw.
+        """
+        query = str(query or "")
+        query_quoted = shlex.quote(query)
+        return str(template or "").format(
+            query=query_quoted,
+            query_quoted=query_quoted,
+        )
+
+    async def _run_voice_gbrain_lite_command(
+        self,
+        command: str,
+        timeout: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Run the configured evidence/read-only retrieval command and parse JSON."""
+        if not command:
+            return None
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=max(0.1, float(timeout or 1.5))
+            )
+        except asyncio.TimeoutError:
+            logger.debug("Voice gbrain-lite lookup timed out")
+            return None
+        except Exception as exc:
+            logger.debug("Voice gbrain-lite lookup failed: %s", exc)
+            return None
+        if proc.returncode != 0:
+            err = (stderr or b"").decode(errors="replace")[:200]
+            logger.debug("Voice gbrain-lite lookup exited %s: %s", proc.returncode, err)
+            return None
+        text = (stdout or b"").decode(errors="replace").strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError:
+            # Some CLIs are chatty; take the last JSON-looking line rather than
+            # failing the whole fast path. Don't log the payload: it may contain
+            # snippets from private memory/evidence.
+            for line in reversed(text.splitlines()):
+                line = line.strip()
+                if not line.startswith("{"):
+                    continue
+                try:
+                    parsed = json.loads(line)
+                    return parsed if isinstance(parsed, dict) else None
+                except json.JSONDecodeError:
+                    continue
+        return None
+
+    async def _try_voice_gbrain_lite_evidence(
+        self,
+        *,
+        event: MessageEvent,
+        transcript: str,
+        adapter,
+        text_channel_id: int,
+    ) -> bool:
+        """Handle high-confidence voice evidence hits before invoking the full agent."""
+        lite_cfg = self._load_voice_gbrain_lite_config()
+        if not lite_cfg or not bool(lite_cfg.get("enabled", False)):
+            return False
+        min_chars = int(lite_cfg.get("min_chars", 12) or 12)
+        if len((transcript or "").strip()) < min_chars:
+            return False
+        command_template = str(lite_cfg.get("command") or "").strip()
+        if not command_template:
+            return False
+        try:
+            command = self._build_voice_gbrain_lite_command(command_template, transcript)
+        except Exception as exc:
+            logger.debug("Voice gbrain-lite command template failed: %s", exc)
+            return False
+        result = await self._run_voice_gbrain_lite_command(
+            command,
+            float(lite_cfg.get("timeout_seconds", 1.5) or 1.5),
+        )
+        if not isinstance(result, dict):
+            return False
+        decision = str(result.get("decision") or "").strip().lower()
+        if decision not in {"answer", "clarify"}:
+            return False
+        spoken_text = str(
+            result.get("spoken_text")
+            or result.get("answer_text")
+            or result.get("text")
+            or ""
+        ).strip()
+        answer_text = str(
+            result.get("answer_text")
+            or result.get("text")
+            or spoken_text
+        ).strip()
+        if not spoken_text and not answer_text:
+            return False
+        if decision == "answer":
+            try:
+                confidence = float(result.get("confidence", 0) or 0)
+            except (TypeError, ValueError):
+                confidence = 0.0
+            min_conf = float(lite_cfg.get("min_answer_confidence", 1.0) or 1.0)
+            if confidence < min_conf:
+                return False
+
+        channel = None
+        try:
+            channel = adapter._client.get_channel(text_channel_id)
+        except Exception:
+            channel = None
+        if channel and answer_text:
+            safe_answer = answer_text[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+            try:
+                await channel.send(safe_answer)
+            except Exception:
+                pass
+
+        if spoken_text:
+            await self._send_voice_reply(event, spoken_text)
+        return True
 
     def _should_send_voice_reply(
         self,

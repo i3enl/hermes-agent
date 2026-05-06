@@ -1259,6 +1259,7 @@ class BasePlatformAdapter(ABC):
         #   fire if chat in _auto_tts_enabled_chats
         #     OR (_auto_tts_default and chat not in _auto_tts_disabled_chats)
         self._auto_tts_default: bool = False
+        self._auto_tts_max_chars: int = 500
         self._auto_tts_enabled_chats: set = set()
         self._auto_tts_disabled_chats: set = set()
         # Chats where typing indicator is paused (e.g. during approval waits).
@@ -2802,11 +2803,31 @@ class BasePlatformAdapter(ABC):
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():
                             import json as _json
-                            speech_text = re.sub(r'[*_`#\[\]()]', '', text_content)[:4000].strip()
+                            speech_text = re.sub(r'[*_`#\[\]()]', '', text_content).strip()
+                            max_chars = int(getattr(self, "_auto_tts_max_chars", 500) or 500)
+                            max_chars = max(120, min(max_chars, 4000))
+                            original_chars = len(speech_text)
+                            if original_chars > max_chars:
+                                speech_text = speech_text[:max_chars].rstrip()
+                                speech_text = re.sub(r'\s+\S*$', '', speech_text).rstrip()
+                                speech_text = f"{speech_text}. I posted the full details in text."
+                                logger.info(
+                                    "[%s] Auto-TTS truncated for latency: %d -> %d chars",
+                                    self.name,
+                                    original_chars,
+                                    len(speech_text),
+                                )
                             if not speech_text:
                                 raise ValueError("Empty text after markdown cleanup")
+                            _tts_start = asyncio.get_running_loop().time()
                             tts_result_str = await asyncio.to_thread(
                                 text_to_speech_tool, text=speech_text
+                            )
+                            logger.info(
+                                "[%s] Auto-TTS generated in %.3fs (%d chars)",
+                                self.name,
+                                asyncio.get_running_loop().time() - _tts_start,
+                                len(speech_text),
                             )
                             tts_data = _json.loads(tts_result_str)
                             _tts_path = tts_data.get("file_path")

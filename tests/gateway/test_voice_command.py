@@ -994,6 +994,105 @@ class TestVoiceChannelCommands:
         mock_adapter.handle_message.assert_called_once()
         mock_channel.send.assert_called_once()
 
+
+
+    def test_voice_gbrain_lite_command_quotes_query_and_preserves_flags(self, runner):
+        """Configured evidence command should shell-quote transcripts and keep static CLI flags."""
+        template = (
+            "ssh sage \"cd ~/clawd/context-memory && /usr/bin/python3 "
+            "scripts/evidence_first_query.py --query {query_quoted} "
+            "--transport discord_voice --auth-tier ben --person Ben --json\""
+        )
+
+        command = runner._build_voice_gbrain_lite_command(template, "email from Molly's claim")
+
+        assert "scripts/evidence_first_query.py" in command
+        assert "--transport discord_voice" in command
+        assert "--auth-tier ben" in command
+        assert "Molly" in command
+        assert "'\"'\"'" in command  # shlex.quote escaped the embedded apostrophe
+
+    def test_voice_gbrain_lite_raw_query_placeholder_is_also_quoted(self, runner):
+        """Even legacy {query} templates must not splice raw transcript text into a shell command."""
+        command = runner._build_voice_gbrain_lite_command(
+            "fake --query {query}",
+            "email'; touch /tmp/pwned #",
+        )
+
+        assert command == "fake --query 'email'\"'\"'; touch /tmp/pwned #'"
+
+    @pytest.mark.asyncio
+    async def test_input_evidence_first_answer_uses_spoken_text_without_agent(self, runner, monkeypatch):
+        """High-confidence evidence-first voice hits should speak/post and skip full agent path."""
+        from gateway.config import Platform
+
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        runner._send_voice_reply = AsyncMock()
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"voice": {"gbrain_lite": {"enabled": True, "timeout_seconds": 0.5, "command": "fake {query_quoted}"}}},
+        )
+
+        async def fake_exec(cmd, timeout):
+            assert "Check" in cmd
+            return {
+                "decision": "answer",
+                "confidence": 1.7,
+                "spoken_text": "Yep, I found the email indexed.",
+                "answer_text": "Yep, I found the email indexed: full evidence details.",
+                "reason": "email_fit,time_fit",
+            }
+
+        runner._run_voice_gbrain_lite_command = fake_exec
+
+        await runner._handle_voice_channel_input(111, 42, "Check for ingested email")
+
+        mock_adapter.handle_message.assert_not_called()
+        runner._send_voice_reply.assert_awaited_once()
+        voice_event, spoken = runner._send_voice_reply.await_args.args
+        assert voice_event.message_type == MessageType.VOICE
+        assert spoken == "Yep, I found the email indexed."
+        sent_messages = [call.args[0] for call in mock_channel.send.await_args_list]
+        assert any("full evidence details" in msg for msg in sent_messages)
+
+    @pytest.mark.asyncio
+    async def test_input_evidence_first_not_found_falls_back_to_agent(self, runner, monkeypatch):
+        """Weak/not_found evidence-first results should not suppress the normal Hermes agent path."""
+        from gateway.config import Platform
+
+        mock_adapter = AsyncMock()
+        mock_adapter._voice_text_channels = {111: 123}
+        mock_adapter._voice_sources = {}
+        mock_channel = AsyncMock()
+        mock_adapter._client = MagicMock()
+        mock_adapter._client.get_channel = MagicMock(return_value=mock_channel)
+        mock_adapter.handle_message = AsyncMock()
+        runner.adapters[Platform.DISCORD] = mock_adapter
+        runner._send_voice_reply = AsyncMock()
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"voice": {"gbrain_lite": {"enabled": True, "timeout_seconds": 0.5, "command": "fake {query_quoted}"}}},
+        )
+
+        async def fake_exec(cmd, timeout):
+            return {"decision": "not_found", "confidence": 0.0, "spoken_text": "No match."}
+
+        runner._run_voice_gbrain_lite_command = fake_exec
+
+        await runner._handle_voice_channel_input(111, 42, "What did I ask yesterday?")
+
+        mock_adapter.handle_message.assert_called_once()
+        runner._send_voice_reply.assert_not_awaited()
+
     # -- _get_guild_id --
 
     def test_get_guild_id_from_guild(self, runner):
