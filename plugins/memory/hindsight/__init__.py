@@ -504,6 +504,40 @@ def _load_simple_env(path) -> dict[str, str]:
     return values
 
 
+def _import_hindsight_embedded():
+    """Import HindsightEmbedded, recovering from a stale top-level module.
+
+    Long-lived Hermes processes can retain a bad ``sys.modules['hindsight']``
+    entry from an earlier partial/lazy import. In that state ``from hindsight
+    import HindsightEmbedded`` fails with ``unknown location`` even after a
+    fresh process can import the installed package. Evict that stale module and
+    fall back to the package's ``hindsight.embedded`` submodule before giving up.
+    """
+    import importlib
+    import sys
+
+    try:
+        from hindsight import HindsightEmbedded
+        return HindsightEmbedded
+    except ImportError as first_exc:
+        if "HindsightEmbedded" not in str(first_exc):
+            raise
+        stale_module = sys.modules.pop("hindsight", None)
+        sys.modules.pop("hindsight.embedded", None)
+        importlib.invalidate_caches()
+        logger.warning(
+            "Retrying HindsightEmbedded import after stale hindsight module: origin=%s type=%s",
+            getattr(stale_module, "__file__", None),
+            type(stale_module).__name__ if stale_module is not None else None,
+        )
+        try:
+            from hindsight import HindsightEmbedded
+            return HindsightEmbedded
+        except ImportError:
+            embedded = importlib.import_module("hindsight.embedded")
+            return embedded.HindsightEmbedded
+
+
 def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None) -> dict[str, str]:
     """Build the profile-scoped env file that standalone hindsight-embed consumes."""
     current_key = llm_api_key
@@ -1026,7 +1060,7 @@ class HindsightMemoryProvider(MemoryProvider):
                     pass
                 except Exception as _e:
                     raise ImportError(str(_e))
-                from hindsight import HindsightEmbedded
+                HindsightEmbedded = _import_hindsight_embedded()
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")
                 if llm_provider in {"openai_compatible", "openrouter"}:

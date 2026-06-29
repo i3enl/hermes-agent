@@ -21,8 +21,9 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
-    _load_config,
     _build_embedded_profile_env,
+    _import_hindsight_embedded,
+    _load_config,
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _resolve_bank_id_template,
@@ -442,6 +443,43 @@ class TestConfig:
 
         assert captured["idle_timeout"] == 0
         assert captured["llm_provider"] == "openai"
+
+    def test_import_hindsight_embedded_recovers_from_stale_top_level_module(self, tmp_path, monkeypatch):
+        package_dir = tmp_path / "hindsight"
+        package_dir.mkdir()
+        (package_dir / "__init__.py").write_text(
+            "class HindsightEmbedded:\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace())
+        sys.modules.pop("hindsight.embedded", None)
+
+        embedded_cls = _import_hindsight_embedded()
+
+        assert embedded_cls.__name__ == "HindsightEmbedded"
+        assert embedded_cls.__module__ == "hindsight"
+        assert getattr(sys.modules.get("hindsight"), "__file__", "").endswith("__init__.py")
+
+    def test_import_hindsight_embedded_falls_back_to_embedded_submodule(self, tmp_path, monkeypatch):
+        package_dir = tmp_path / "hindsight"
+        package_dir.mkdir()
+        (package_dir / "__init__.py").write_text("# valid package, export intentionally missing\n", encoding="utf-8")
+        (package_dir / "embedded.py").write_text(
+            "class HindsightEmbedded:\n"
+            "    pass\n",
+            encoding="utf-8",
+        )
+        monkeypatch.syspath_prepend(str(tmp_path))
+        monkeypatch.setitem(sys.modules, "hindsight", SimpleNamespace())
+        sys.modules.pop("hindsight.embedded", None)
+
+        embedded_cls = _import_hindsight_embedded()
+
+        assert embedded_cls.__name__ == "HindsightEmbedded"
+        assert embedded_cls.__module__ == "hindsight.embedded"
+        assert getattr(sys.modules.get("hindsight"), "__file__", "").endswith("__init__.py")
 
 
 class TestPostSetup:
