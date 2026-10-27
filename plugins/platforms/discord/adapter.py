@@ -122,6 +122,33 @@ from gateway.platforms.base import (
 from tools.url_safety import is_safe_url
 
 
+class MalformedAttachmentEncodingError(ValueError):
+    """An attachment's HTTP Content-Encoding (e.g. ``br``) failed to decode.
+
+    brotlicffi >= 1.2.1.0 (libbrotli 1.2.1, CVE-2026-111497) rejects any
+    bytes trailing a complete Brotli stream instead of silently ignoring
+    them. We deliberately treat that as a malformed upload: the attachment
+    is skipped (callers log it) rather than tolerated or re-fetched.
+    """
+
+
+def _is_content_decoding_error(exc: BaseException) -> bool:
+    """True if ``exc`` (or anything in its cause chain) is aiohttp's
+    ``ContentEncodingError`` -- i.e. the response body failed to decompress."""
+    try:
+        from aiohttp.http_exceptions import ContentEncodingError
+    except Exception:  # aiohttp not installed
+        return False
+    seen = set()
+    cur: Optional[BaseException] = exc
+    while cur is not None and id(cur) not in seen:
+        if isinstance(cur, ContentEncodingError):
+            return True
+        seen.add(id(cur))
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 async def _wait_for_ready_or_bot_exit(
     ready_event: asyncio.Event,
     bot_task: asyncio.Task,
@@ -5221,6 +5248,13 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             raw_bytes = await reader()
         except Exception as e:
+            if _is_content_decoding_error(e):
+                # Don't re-fetch the same CDN object via the URL fallback:
+                # it would hit the identical decoder rejection.
+                raise MalformedAttachmentEncodingError(
+                    f"Discord attachment {getattr(att, 'filename', None) or '<unknown>'} "
+                    "has a malformed Content-Encoding payload; rejected"
+                ) from e
             logger.warning(
                 "[Discord] Authenticated attachment read failed for %s: %s",
                 getattr(att, "filename", None) or getattr(att, "url", "<unknown>"),
@@ -5300,7 +5334,15 @@ class DiscordAdapter(BasePlatformAdapter):
             ) as resp:
                 if resp.status != 200:
                     raise Exception(f"HTTP {resp.status}")
-                return await resp.read()
+                try:
+                    return await resp.read()
+                except Exception as e:
+                    if _is_content_decoding_error(e):
+                        raise MalformedAttachmentEncodingError(
+                            f"Discord attachment {att.filename or '<unknown>'} "
+                            "has a malformed Content-Encoding payload; rejected"
+                        ) from e
+                    raise
 
     async def _handle_message(self, message: DiscordMessage, role_authorized: bool = False) -> None:
         """Handle incoming Discord messages."""
