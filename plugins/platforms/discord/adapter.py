@@ -5234,6 +5234,11 @@ class DiscordAdapter(BasePlatformAdapter):
         should treat ``None`` as a signal to fall back to the URL-based
         downloaders.
 
+        A body whose Content-Encoding fails to decode (e.g. bytes trailing a
+        complete Brotli stream, rejected by brotlicffi >= 1.2.1.0) raises
+        ``MalformedAttachmentEncodingError`` instead of returning ``None``:
+        re-fetching the same object via the URL fallback cannot succeed.
+
         Oversized attachments (per ``gateway.max_inbound_media_bytes``) raise
         ``ValueError`` BEFORE the bytes are pulled into memory when Discord
         reports the size up front, so a hostile upload can't OOM the gateway.
